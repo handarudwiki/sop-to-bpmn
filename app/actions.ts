@@ -9,6 +9,7 @@ import { redirect } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { parseBpmnXml } from "@/lib/bpmn-parser";
 import { advanceWorkflow } from "@/lib/workflow-engine";
+import { extractProcessFromSop } from "@/lib/gemini-sop";
 import { FieldType, InstanceStatus, NodeType } from "@prisma/client";
 
 // ---------------------------------------------------------------------------
@@ -18,12 +19,25 @@ import { FieldType, InstanceStatus, NodeType } from "@prisma/client";
 /**
  * generateBpmnFromSop — takes plain SOP text and returns a BPMN 2.0 XML string.
  *
- * In a real system this calls an LLM (e.g. Gemini/GPT-4).
- * Here we parse the SOP text to extract numbered steps and build valid XML.
+ * Uses Gemini 3.7 Flash (via the @google/genai SDK) to understand the SOP
+ * and extract a structured, ordered list of workflow steps — handling numbered
+ * lists, bullet points, or free-form prose in any language. We then build valid
+ * BPMN 2.0 XML deterministically from those steps so the downstream parser and
+ * workflow engine keep working unchanged.
+ *
  * Each step becomes a userTask; consecutive steps are linked by sequenceFlows.
- * If a step contains "approve/verif/review/check" an exclusiveGateway is added
- * after it with Approved/Rejected branches.
+ * Steps the model flags as a decision get an exclusiveGateway with
+ * Approved/Rejected branches.
  */
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 export async function generateBpmnFromSop(
   _prevState: { xml: string; error: string } | null,
   formData: FormData
@@ -33,26 +47,21 @@ export async function generateBpmnFromSop(
 
   if (!sopText?.trim()) return { xml: "", error: "SOP text is required." };
 
-  // --- Parse steps from SOP text ---
-  // Supports: "1. Step", "Step 1:", "- Step", "• Step"
-  const lines = sopText
-    .split("\n")
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  const steps: string[] = [];
-  for (const line of lines) {
-    const clean = line
-      .replace(/^(\d+[\.\)]|[-•*])\s*/, "")
-      .replace(/^Step\s*\d+\s*:\s*/i, "")
-      .trim();
-    if (clean.length > 2) steps.push(clean);
+  // --- Extract structured steps (Gemini 3.7 Flash, or static-rule fallback
+  // when no GEMINI_API_KEY is configured) ---
+  let steps;
+  try {
+    const result = await extractProcessFromSop(sopText);
+    steps = result.steps;
+  } catch (err) {
+    console.error("extractProcessFromSop error:", err);
+    return {
+      xml: "",
+      error: err instanceof Error ? err.message : "SOP extraction failed.",
+    };
   }
 
-  if (steps.length === 0)
-    return { xml: "", error: "Could not extract steps from SOP text." };
-
-  // --- Build BPMN 2.0 XML ---
+  // --- Build BPMN 2.0 XML from the extracted steps ---
   const pid = "Process_1";
   const startId = "Start_1";
   const endId = "End_1";
@@ -64,7 +73,7 @@ export async function generateBpmnFromSop(
   const makeFlow = (src: string, tgt: string, name?: string, cond?: string) => {
     const fid = `Flow_${++flowIdx}`;
     const condEl = cond ? `<conditionExpression>${cond}</conditionExpression>` : "";
-    flows.push(`<sequenceFlow id="${fid}" name="${name || ""}" sourceRef="${src}" targetRef="${tgt}">${condEl}</sequenceFlow>`);
+    flows.push(`<sequenceFlow id="${fid}" name="${escapeXml(name || "")}" sourceRef="${src}" targetRef="${tgt}">${condEl}</sequenceFlow>`);
     return fid;
   };
 
@@ -74,19 +83,12 @@ export async function generateBpmnFromSop(
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     const taskId = `Task_${i + 1}`;
-    const lower = step.toLowerCase();
-    elements.push(`<userTask id="${taskId}" name="${step.replace(/"/g, "'")}">`);
-    elements.push(`  <documentation>${step}</documentation>`);
+    elements.push(`<userTask id="${taskId}" name="${escapeXml(step.name)}">`);
+    elements.push(`  <documentation>${escapeXml(step.description || step.name)}</documentation>`);
     elements.push(`</userTask>`);
     makeFlow(prevId, taskId);
 
-    const isApproval =
-      lower.includes("approv") ||
-      lower.includes("verif") ||
-      lower.includes("review") ||
-      lower.includes("check");
-
-    if (isApproval) {
+    if (step.isDecision) {
       const gwId = `Gateway_${i + 1}`;
       const rejEndId = `End_Rejected_${i + 1}`;
       elements.push(`<exclusiveGateway id="${gwId}" name="Approved?"/>`);
@@ -111,7 +113,7 @@ export async function generateBpmnFromSop(
              xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
              targetNamespace="http://bpmn.io/schema/bpmn"
              id="Definitions_1">
-  <process id="${pid}" name="${processName.replace(/"/g, "'")}" isExecutable="true">
+  <process id="${pid}" name="${escapeXml(processName)}" isExecutable="true">
 ${elements.map(e => "    " + e).join("\n")}
 ${flows.map(f => "    " + f).join("\n")}
   </process>
