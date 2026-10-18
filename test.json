@@ -1,0 +1,11 @@
+{
+    "data": {
+        "getJobTitleSuggestions": {
+            "__typename": "getJobTitleSuggestions",
+            "count": 0,
+            "expInfo": "",
+            "jobTitles": []
+        }
+    },
+    "isAuthenticated": false
+}
